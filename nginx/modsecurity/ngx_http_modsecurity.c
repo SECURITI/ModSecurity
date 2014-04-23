@@ -41,6 +41,10 @@ typedef struct {
 
     apr_bucket_brigade  *brigade;
     unsigned             complete;
+
+    ngx_int_t           request_processed;
+    ngx_int_t           waiting_more_body;
+    ngx_int_t           body_requested;
 } ngx_http_modsecurity_ctx_t;
 
 
@@ -48,7 +52,7 @@ typedef struct {
 ** Module's registred function/handlers.
 */
 static ngx_int_t ngx_http_modsecurity_handler(ngx_http_request_t *r);
-static void ngx_http_modsecurity_body_handler(ngx_http_request_t *r);
+static void ngx_http_modsecurity_request_read(ngx_http_request_t *r);
 static ngx_int_t ngx_http_modsecurity_header_filter(ngx_http_request_t *r);
 static ngx_int_t ngx_http_modsecurity_body_filter(ngx_http_request_t *r, ngx_chain_t *in);
 static ngx_int_t ngx_http_modsecurity_preconfiguration(ngx_conf_t *cf);
@@ -457,24 +461,31 @@ ngx_http_modsecurity_load_request_body(ngx_http_request_t *r)
 {
     ngx_http_modsecurity_ctx_t    *ctx;
 
+
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        "ModSec: loading request body.");
+
     ctx = ngx_http_get_module_ctx(r, ngx_http_modsecurity);
 
     modsecSetBodyBrigade(ctx->req, ctx->brigade);
 
     if (r->request_body == NULL || r->request_body->bufs == NULL) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "ModSec: request was null.");
+
 
         return move_chain_to_brigade(NULL, ctx->brigade, r->pool, 1);
     }
 
     if (move_chain_to_brigade(r->request_body->bufs, ctx->brigade, r->pool, 1) != NGX_OK) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "ModSec: failed to move chain to brigade.");
+
         return NGX_ERROR;
     }
 
-    r->request_body = NULL;
-
     return NGX_OK;
 }
-
 
 static ngx_inline ngx_int_t
 ngx_http_modsecurity_save_request_body(ngx_http_request_t *r)
@@ -485,6 +496,7 @@ ngx_http_modsecurity_save_request_body(ngx_http_request_t *r)
     ngx_http_core_srv_conf_t      *cscf;
     size_t                         size;
     ngx_http_connection_t         *hc;
+
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_modsecurity);
 
@@ -797,6 +809,119 @@ ngx_http_modsecurity_status(ngx_http_request_t *r, int status)
 }
 
 
+/*
+ * @brief Process request whenever `request header` and `body` are ready for.
+ *
+ * This function provides calls ModSecurity standalone library in the necessary
+ * order to analisys: `request headers` and `request body`.
+ *
+ * @note ModSecurity state can change by ctl:ruleEngine=off
+ *
+ * @param r pointer to ngx_http_request_t.
+ *
+ */
+static void
+ngx_http_modsecurity_process_request(ngx_http_request_t *r)
+{
+    ngx_int_t rc = 0;
+    ngx_http_modsecurity_ctx_t *ctx;
+    int load_request_body = 0;
+
+    ctx = ngx_http_get_module_pool_ctx(r, ngx_http_modsecurity);
+
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        "ModSec: starting to process the request...");
+
+    if (ngx_http_modsecurity_load_request(r) != NGX_OK) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+               "ModSec: failed while loading the request.");
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        goto terminate;
+    }
+
+    if (ngx_http_modsecurity_load_headers_in(r) != NGX_OK) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+               "ModSec: failed while loading the headers.");
+        ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        goto terminate;
+    }
+
+    rc = modsecProcessRequestHeaders(ctx->req);
+    rc = ngx_http_modsecurity_status(r, rc);
+    if (rc != NGX_DECLINED) {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+               "ModSec: failed while processing the request headers");
+        ngx_http_finalize_request(r, rc);
+    }
+
+
+    /* Here we check if ModSecurity is enabled or disabled again.
+     * This is a kind of hack. ModSecurity can be disable by:
+     * ctl:ruleEngine=off, which shouldn't be a problem. However, due to
+     * the way that standalone is handling this situation this lead us to
+     * a problem that may end up by freezing the connection. As we don't
+     * want that we verify if it was disabled prior to load the request body.
+     *
+     * Note that we still have to call modsecProcessRequestBody even if
+     * ModSecurity is disabled, this is necessary to have a workable audit log.
+     *
+     * Changes on standalone should be coordenated with others like IIS, so
+     * leaving this dirty hack here.
+     */
+    if (r->method == NGX_HTTP_POST &&
+        modsecIsRequestBodyAccessEnabled(ctx->req) &&
+        modsecContextState(ctx->req) != MODSEC_DISABLED) {
+
+        load_request_body = 1;
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "ModSec: request body will be processed...");
+    }
+
+    if (load_request_body) {
+        rc = ngx_http_modsecurity_load_request_body(r);
+        if (rc != NGX_OK)
+        {
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "ModSec: failed while loading the request body.");
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        }
+    }
+
+    ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        "ModSec: processing request body...");
+
+    rc = modsecProcessRequestBody(ctx->req);
+    rc = ngx_http_modsecurity_status(r, rc);
+    if (rc != NGX_DECLINED)
+    {
+        ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "ModSec: finalizing the connection after process the " \
+            "request body.");
+
+        ngx_http_finalize_request(r, rc);
+    }
+
+    if (load_request_body) {
+        if (ngx_http_modsecurity_save_request_body(r) != NGX_OK)
+        {
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "ModSec: failed while saving the request body");
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        }
+
+        if (ngx_http_modsecurity_save_headers_in(r) != NGX_OK)
+        {
+            ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "ModSec: failed while saving the headers in");
+            ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+        }
+    }
+terminate:
+    return;
+}
+
+
+
 /* create loc conf struct */
 static void *
 ngx_http_modsecurity_create_loc_conf(ngx_conf_t *cf)
@@ -945,115 +1070,126 @@ ngx_http_modsecurity_init_process(ngx_cycle_t *cycle)
 }
 
 
-/*
-** [ENTRY POINT] does : this function called by nginx from the request handler
-*/
 static ngx_int_t
-ngx_http_modsecurity_handler(ngx_http_request_t *r)
-{
-    ngx_http_modsecurity_loc_conf_t *cf;
-    ngx_http_modsecurity_ctx_t      *ctx;
-    ngx_int_t                        rc;
+ngx_http_modsecurity_handler(ngx_http_request_t *r) {
+    ngx_int_t rc = NULL;
+    ngx_http_modsecurity_ctx_t *ctx = NULL;
+    ngx_http_modsecurity_loc_conf_t *cf = NULL;
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSec: Catching a new access phase handler");
 
     cf = ngx_http_get_module_loc_conf(r, ngx_http_modsecurity);
 
     /* Process only main request */
     if (r != r->main || !cf->enable) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSec: ModSecurity is not enabled or not a main request.");
+
         return NGX_DECLINED;
     }
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "modSecurity: handler");
-
-    /* create / retrive request ctx */
-    if (r->internal) {
-        
-        ctx = ngx_http_get_module_pool_ctx(r, ngx_http_modsecurity);
-
-        if (ctx) {
-            /* we have already processed the request headers */
-            ngx_http_set_ctx(r, ctx, ngx_http_modsecurity);
-            return NGX_DECLINED;
-        }
-
-        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "modSecurity: request pool ctx empty");
-    }
-
-    ctx = ngx_http_modsecurity_create_ctx(r);
-    if (ctx == NULL) {
-
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    ngx_http_set_ctx(r, ctx, ngx_http_modsecurity);
-
-    if (ngx_http_set_pool_ctx(r, ctx, ngx_http_modsecurity) != NGX_OK) {
-        return NGX_ERROR;
-    }
-
-    /* load request to request rec */
-    if (ngx_http_modsecurity_load_request(r) != NGX_OK
-        || ngx_http_modsecurity_load_headers_in(r) != NGX_OK) {
-
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-
-    /* processing request headers */
-    rc = ngx_http_modsecurity_status(r, modsecProcessRequestHeaders(ctx->req));
-
-    if (rc != NGX_DECLINED) {
-        return rc;
-    }
-
-    if (modsecContextState(ctx->req) == MODSEC_DISABLED) {
-        return NGX_DECLINED;
-    }
-
-    if (r->method == NGX_HTTP_POST 
-            && modsecIsRequestBodyAccessEnabled(ctx->req) ) {
-
-        /* read POST request body, should we process PUT? */
-        rc = ngx_http_read_client_request_body(r, ngx_http_modsecurity_body_handler);
-        if (rc >= NGX_HTTP_SPECIAL_RESPONSE) {
-            return rc;
-        }
-
-        return NGX_DONE;
-    }
-    
-    /* other method */
-    return ngx_http_modsecurity_status(r, modsecProcessRequestBody(ctx->req));
-}
-
-
-static void
-ngx_http_modsecurity_body_handler(ngx_http_request_t *r)
-{
-    ngx_http_modsecurity_ctx_t    *ctx;
-    ngx_int_t                      rc;
-
-    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "modSecurity: body handler");
 
     ctx = ngx_http_get_module_ctx(r, ngx_http_modsecurity);
 
-    if (ngx_http_modsecurity_load_request_body(r) != NGX_OK) {
-        return ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSec: Recovering ctx: %p", ctx);
+
+    if (ctx == NULL) {
+        ctx = ngx_http_modsecurity_create_ctx(r);
+
+        ngx_http_set_ctx(r, ctx, ngx_http_modsecurity);
+
+        if (ngx_http_set_pool_ctx(r, ctx, ngx_http_modsecurity) != NGX_OK) {
+            return NGX_ERROR;
+        }
+
+
     }
 
-    rc = ngx_http_modsecurity_status(r, modsecProcessRequestBody(ctx->req));
+    if (ctx == NULL) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSec: ctx is null, nothing we can do, returning.");
 
-    if (rc != NGX_DECLINED) {
-        return ngx_http_finalize_request(r, rc);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
     }
 
-    if (ngx_http_modsecurity_save_request_body(r) != NGX_OK
-            || ngx_http_modsecurity_save_headers_in(r) != NGX_OK ) {
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSec: ctx is now: %p", ctx);
 
-        return ngx_http_finalize_request(r, NGX_HTTP_INTERNAL_SERVER_ERROR);
+    if (modsecContextState(ctx->req) == MODSEC_DISABLED) {
+        ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSec: ModSecurity was disabled, returning....", ctx);
+
+        return NGX_DECLINED;
     }
 
-    r->phase_handler++;
-    ngx_http_core_run_phases(r);
-    ngx_http_finalize_request(r, NGX_DONE);
+    if (ctx->waiting_more_body == 1) {
+       ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSec: waiting for more data before proceed.");
+
+        return NGX_DONE;
+    }
+
+    if (ctx->body_requested == 0) {
+       ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSec: asking for the request body, if any.");
+
+        ctx->body_requested = 1;
+
+        r->request_body_in_single_buf = 1;
+        r->request_body_in_persistent_file = 1;
+        r->request_body_in_clean_file = 1;
+
+        rc = ngx_http_read_client_request_body(r,
+            ngx_http_modsecurity_request_read);
+
+        if (rc == NGX_ERROR || rc >= NGX_HTTP_SPECIAL_RESPONSE) {
+           return rc;
+        }
+
+        if (rc == NGX_AGAIN) {
+            ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                "ModSec: nginx is asking us to wait for more data.");
+
+            ctx->waiting_more_body = 1;
+            return NGX_DONE;
+        }
+    }
+    if (ctx->waiting_more_body == 0 && ctx->request_processed == 0) {
+        ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "ModSec: request is ready to be processed.");
+        ngx_http_modsecurity_process_request(r);
+        ctx->request_processed = 1;
+    }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        "ModSec: returning NGX_OK.");
+
+    return NGX_OK;
+}
+
+
+
+/* post read callback for rewrite and access phases */
+static void
+ngx_http_modsecurity_request_read(ngx_http_request_t *r)
+{
+
+    ngx_http_modsecurity_ctx_t *ctx;
+
+    ctx = ngx_http_get_module_pool_ctx(r, ngx_http_modsecurity);
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+        "ModSec: reading request body...");
+
+    if (ctx->waiting_more_body) {
+        ctx->waiting_more_body = 0;
+        /* Calling the actual phase again. Now with full body. */
+        ngx_http_core_run_phases(r);
+    }
+    else {
+        r->main->count--;
+    }
 }
 
 
@@ -1182,16 +1318,31 @@ ngx_http_modsecurity_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
 
     rc = move_brigade_to_chain(ctx->brigade, &out, r->pool);
     if (rc == NGX_ERROR) {
+           ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSec: Problems moving brigade to chain");
+
         return ngx_http_filter_finalize_request(r, 
                  &ngx_http_modsecurity, NGX_HTTP_INTERNAL_SERVER_ERROR);
     }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSecurity: save headers out done: before");
+
 
     if (ngx_http_modsecurity_save_headers_in(r) != NGX_OK
             ||ngx_http_modsecurity_save_headers_out(r) != NGX_OK) {
 
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSecurity: save headers out done _inside_");
+
+
         return ngx_http_filter_finalize_request(r, 
                  &ngx_http_modsecurity, NGX_HTTP_INTERNAL_SERVER_ERROR);
     }
+
+    ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                   "ModSecurity: save headers out done: done");
+
 
     if (r->headers_out.content_length_n != -1) {
 
@@ -1200,9 +1351,12 @@ ngx_http_modsecurity_body_filter(ngx_http_request_t *r, ngx_chain_t *in)
     }
 
     r->header_sent = 0;
-    rc = ngx_http_next_header_filter(r);
 
+    rc = ngx_http_next_header_filter(r);
     if (rc == NGX_ERROR || rc > NGX_OK) {
+       ngx_log_debug0(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+           "ModSecurity: ngx_http_next_header_filter not NGX_OK.");
+
         return ngx_http_filter_finalize_request(r, &ngx_http_modsecurity, rc);
     }
 
@@ -1241,6 +1395,10 @@ ngx_http_modsecurity_create_ctx(ngx_http_request_t *r)
     cln->data = ctx;
 
     ctx->r = r;
+
+    ctx->request_processed = 0;
+    ctx->waiting_more_body = 0;
+    ctx->body_requested = 0;
 
     if (r->connection->requests == 0 || ctx->connection == NULL) {
 
@@ -1325,10 +1483,12 @@ ngx_http_modsecurity_create_ctx(ngx_http_request_t *r)
     return ctx;
 }
 
-    static void
+static void
 ngx_http_modsecurity_cleanup(void *data)
 {
-    ngx_http_modsecurity_ctx_t    *ctx = data;
+    ngx_http_modsecurity_ctx_t *ctx = data;
+
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, ctx->r->connection->log, 0, "ModSec: Cleaning up: %p ", data);
 
     if (ctx->req != NULL) {
         (void) modsecFinishRequest(ctx->req);
@@ -1391,7 +1551,7 @@ ngx_http_modsecurity_enable(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 
-    static int
+static int
 ngx_http_modsecurity_drop_action(request_rec *r)
 {
     ngx_http_modsecurity_ctx_t     *ctx;
